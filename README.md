@@ -1,5 +1,5 @@
 # Emacs Abella Mode
-A major mode for the [Abella](abella-prover.org) proof assistant in Emacs.
+A major mode for the [Abella](https://abella-prover.org) proof assistant in Emacs.
 
 # Features
 
