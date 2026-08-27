@@ -28,7 +28,7 @@ through `abella_mcp`. Thus multiple sessions may be run independently.
 
 # Installation
 
-You must first make sure that `abella` and  [`abella_mcp`](github.com/nguermond/abella-mcp) are installed in your `PATH` to enable interaction with abella. 
+You must first make sure that `abella` and  [`abella_mcp`](https://github.com/nguermond/abella-mcp) are installed in your `PATH` to enable interaction with abella. 
 If this is not installed, syntax highlighting should still work, 
 but interaction with abella will be disabled. 
 
@@ -38,3 +38,6 @@ To install, copy `abella.el` and `abella-mcp.el` (even if `abella_mcp` is not in
 (load (expand-file-name "<rel-path-to>/abella.el" user-emacs-directory))
 (load (expand-file-name "<rel-path-to>/abella-mcp.el" user-emacs-directory))
 ```
+
+# Contributing and Disclaimer
+Contributions welcome, but please discuss potential changes or features in an issue before contributing. These files are to a large extent AI generated, use at your own risk.

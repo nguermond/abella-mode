@@ -1,3 +1,6 @@
+;; Copyright (C) 2026  Nathan Guermond
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;; Interactive Abella proof checking via abella_mcp.
 ;;
 ;; abella_mcp is an MCP server (newline-delimited JSON-RPC 2.0 over
