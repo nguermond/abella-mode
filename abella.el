@@ -1,6 +1,6 @@
 ;; Copyright (C) 2026  Nathan Guermond
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Version 0.1.0
+;; Version 0.1.1
 
 ;; Emacs mode for Abella theorem files.
 ;;

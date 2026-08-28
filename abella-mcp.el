@@ -1,6 +1,6 @@
 ;; Copyright (C) 2026  Nathan Guermond
 ;; SPDX-License-Identifier: GPL-3.0-or-later
-;; Version 0.1.0
+;; Version 0.1.1
 
 ;; Interactive Abella proof checking via abella_mcp.
 ;;
@@ -156,16 +156,46 @@ buffer's text has been sent to Abella.")
   "Bound to t while retracting from `abella--on-change', so a mid-edit
 auto-retraction doesn't yank point away from where you're typing.")
 
+;; Adapted from `proof-set-overlay-arrow' in GNU Proof General
+;; (generic/proof-script.el), whose copyright notice reads:
+;;   Portions © Copyright 1994-2012  David Aspinall and University of Edinburgh
+;;   Portions © Copyright 2003-2021  Free Software Foundation, Inc.
+;;   Portions © Copyright 2001-2017  Pierre Courtieu
+;;   Portions © Copyright 2010, 2016  Erik Martin-Dorel
+;;   Portions © Copyright 2011-2013, 2016-2017  Hendrik Tews
+;;   Portions © Copyright 2015-2017  Clément Pit-Claudel
+;; Used under the terms of the GNU General Public License, version 3
+;; or later (SPDX-License-Identifier: GPL-3.0-or-later).
+(defun abella--arrow-position (pos)
+  "Normalize POS to a beginning-of-line position for the fringe arrow,
+mirroring Proof General's `proof-set-overlay-arrow'.  Our locked
+position is normally mid-line -- right after the period ending a
+command, not the start of the next line -- and that only happens to
+coincide with beginning-of-line for POS = (point-min); everywhere else
+the arrow needs a bol position to render reliably."
+  (save-excursion
+    (goto-char pos)
+    (skip-chars-forward " \t\n")
+    (unless (eq (point) (point-max))
+      (beginning-of-line))
+    (point)))
+
 (defun abella--update-locked-marker ()
   (let ((pos (abella-locked-position)))
     (unless (markerp abella-locked-marker)
       (setq abella-locked-marker (make-marker)))
-    (set-marker abella-locked-marker pos)
-    ;; The fringe arrow depends on rendering details (fringe width,
-    ;; terminal vs GUI) that don't always cooperate; moving point itself
-    ;; is unambiguous and always visible.
+    (set-marker abella-locked-marker (abella--arrow-position pos) (current-buffer))
     (unless abella--suppress-goto
-      (goto-char pos))))
+      (goto-char pos)
+      ;; gud.el's overlay-arrow (the same mechanism we use) never
+      ;; relies on `goto-char' alone -- it always also calls
+      ;; `set-window-point' on the displaying window. Our own moves
+      ;; happen around a blocking network round trip to abella_mcp,
+      ;; which is exactly the kind of gap where window-point and
+      ;; buffer-point can drift apart and the fringe arrow silently
+      ;; stops following, even though `(point)' itself is correct.
+      (dolist (win (get-buffer-window-list (current-buffer) nil t))
+        (set-window-point win pos)))))
 
 (defun abella--on-change (beg _end _len)
   "If an edit touches text at or before the locked position, the
