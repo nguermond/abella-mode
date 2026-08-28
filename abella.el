@@ -4,9 +4,10 @@
 
 ;; Emacs mode for Abella theorem files.
 ;;
-;; Based on tutorial at:
-;;   http://two-wugs.net/emacs/mode-tutorial.html
-;;
+;; Loosely based on emacs/abella.el from the original Abella distribution by Andrew Gacek:
+;;   Copyright (C) 2007-2009 Gacek
+;; Used under the terms of the GNU General Public License, version 3
+;; or later (SPDX-License-Identifier: GPL-3.0-or-later).
 
 (defvar abella-mode-hook nil)
 
