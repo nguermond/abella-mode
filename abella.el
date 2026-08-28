@@ -81,32 +81,6 @@
     abella-mode-keymap)
   "Keymap for Abella major mode")
 
-(defun abella-forward-command ()
-  (interactive)
-  (search-forward-regexp "%\\|\\.")
-  (if (equal (match-string 0) "%")
-      (progn (beginning-of-line)
-             (next-line 1)
-             (abella-forward-command))))
-
-
-(defun abella-backward-command ()
-  (interactive)
-  (backward-char 1)
-  (abella-backward-command-rec)
-  (if (not (bobp))
-    (forward-char 1)))
-
-(defun abella-backward-command-rec ()
-  (interactive)
-  (while (search-backward "%" (point-at-bol) t))
-  (if (not (search-backward "." (point-at-bol) t))
-      (progn
-        (beginning-of-line 1)
-        (if (not (bobp))
-            (progn (end-of-line 0)
-                   (abella-backward-command-rec))))))
-
 ;; Indentation.
 ;;
 ;; Rules:
