@@ -1,0 +1,482 @@
+;; Copyright (C) 2026  Nathan Guermond
+;; SPDX-License-Identifier: GPL-3.0-or-later
+;; Version 0.1.1
+
+;; Inline LaTeX previews for Abella theorem files, via abella_mcp's
+;; abella2tex tool and the MELPA `math-preview' package.
+;;
+;; This file is entirely optional: `abella.el' and `abella-mcp.el' never
+;; reference it, so a user who doesn't load it gets abella-mode exactly as
+;; it works without this feature. Two independent things can be missing --
+;; the `math-preview' Emacs package, and the `abella2tex' opam package on
+;; the abella_mcp side (it "must be installed separately", per abella-mcp's
+;; own README) -- and both degrade to a plain message from
+;; `abella-tex-toggle-preview' rather than breaking anything else.
+;;
+;; Load this after abella.el and abella-mcp.el; it uses functions from both
+;; (abella-command-start and friends from abella.el, abella-mcp-call-tool
+;; and abella-output-buffer-name from abella-mcp.el).
+;;
+;; Rendering always happens in the *abella:...* OUTPUT buffer, never the
+;; .thm source buffer: `C-c C-l' toggles a persistent per-(source-)buffer
+;; flag, `abella-tex--render-output-p'. While it's on, every future
+;; output-buffer display -- a full proof state (every hypothesis, and the
+;; goal, each rendered separately since abella2tex renders one term at a
+;; time) or a finalized session event (each top-level command --
+;; declarations, or a whole theorem once its proof closes -- kept as a
+;; persistent, append-only log by abella-mcp.el's own `abella-events',
+;; likewise) alike -- shows as TeX instead of plain Abella syntax, for as
+;; long as the flag stays on -- this is done via `:after' advice on
+;; `abella--show-live-state' and `abella--append-events' (abella-mcp.el),
+;; rather than by duplicating every call site that can update the output
+;; buffer (stepping, retracting, and even TAB-triggered indentation can
+;; all resync and redisplay the state -- advising the two shared display
+;; functions catches all of them for free). A finalized event is rendered
+;; straight from its own `abella-event-command' (clean source text
+;; abella-mcp.el already captured from the source buffer), not by
+;; re-parsing whatever ended up displayed -- unlike the earlier version
+;; of this file, which had to regex-guess command boundaries out of the
+;; output buffer's own text, the same guesswork the ad hoc region-preview
+;; case below still needs (`abella-tex--strip-header'), since a manually
+;; selected region has no such structured event behind it.
+;; Turning the flag off only removes the overlays math-preview placed;
+;; since an overlay changes display, not text, the plain state/log
+;; underneath is still there and reverts instantly. A selected region
+;; gets an ad hoc one-shot render instead, also shown in the output
+;; buffer, independent of this persistent mode.
+
+(require 'cl-lib)
+
+(defgroup abella nil
+  "Abella proof assistant mode."
+  :group 'languages)
+
+(defcustom abella-tex-notation-configs nil
+  "List of abella2tex notation config file paths for this project.
+Relative paths are resolved against the buffer's `default-directory'
+before being sent to abella_mcp -- the shared abella_mcp process's own
+cwd is whatever buffer happened to start it first, not necessarily
+related to the current buffer's directory, so relative paths must be
+expanded on the Emacs side. Typically set per-project via
+`.dir-locals.el'.
+
+When nil (the default), a file named `notation.conf' in the same
+directory as the current buffer's file is used instead, if one exists
+-- see `abella-tex--auto-notation-config'. Setting this variable
+disables that auto-discovery; it is used exactly as given."
+  :type '(repeat file)
+  :group 'abella)
+
+(defvar abella-tex--math-preview-available (require 'math-preview nil t)
+  "Non-nil if the `math-preview' package (MELPA) could be loaded.
+When nil, `abella-tex-toggle-preview' reports this via `user-error'
+instead of failing to load abella-tex.el at all.")
+
+;; ------------------------------------------------------------------
+;; Calling abella2tex
+;; ------------------------------------------------------------------
+
+(defun abella-tex--auto-notation-config ()
+  "Path to a `notation.conf' file in the same directory as the current
+buffer's file, if one exists, else nil. Used by `abella-tex--configs-arg'
+as a fallback when `abella-tex-notation-configs' is unset."
+  (let ((dir (and buffer-file-name (file-name-directory buffer-file-name))))
+    (when dir
+      (let ((path (expand-file-name "notation.conf" dir)))
+        (and (file-exists-p path) path)))))
+
+(defun abella-tex--configs-arg ()
+  "The `configs' argument for the abella2tex tool call: an absolute-path
+JSON array built from `abella-tex-notation-configs', or, when that is
+unset, from `abella-tex--auto-notation-config'."
+  (let ((configs (or abella-tex-notation-configs
+                      (let ((auto (abella-tex--auto-notation-config)))
+                        (and auto (list auto))))))
+    (vconcat (mapcar (lambda (p) (expand-file-name p default-directory)) configs))))
+
+(defun abella-tex--strip-header (s)
+  "Strip a leading Abella top-level header from S, so a statement or
+clause list pasted straight from a .thm file parses as a bare
+term/clause-list: \"Theorem NAME :\"/\"Lemma NAME :\" up through the
+first colon, \"Define ... by\"/\"CoDefine ... by\" up through \"by\", or
+a bare \"Query\" keyword. Mirrors the standalone abella2tex CLI's own
+`strip_header' (bin/main.ml in the abella2tex project) -- verified by
+reading the abella-mcp source that its abella2tex *tool* does NOT do
+this itself despite its docstring implying it does (tex_tool.real.ml
+calls Pipeline.render directly on the given source with no such step),
+so this has to happen here instead."
+  (with-syntax-table abella-mode-syntax-table
+    (let* ((case-fold-search nil)
+           (s (string-trim s)))
+      (cond
+       ((string-match "\\`\\<\\(?:Theorem\\|Lemma\\)\\>" s)
+        (if (string-match ":" s) (substring s (1+ (match-beginning 0))) s))
+       ((string-match "\\`\\<\\(?:Define\\|CoDefine\\)\\>" s)
+        (if (string-match "\\<by\\>" s) (substring s (match-end 0)) s))
+       ((string-match "\\`\\<Query\\>" s) (substring s (match-end 0)))
+       (t s)))))
+
+(defun abella-tex--render (source mode)
+  "Render SOURCE (Abella source syntax) to TeX via abella_mcp's abella2tex
+tool, under MODE (\"term\", \"clauses\", or \"commands\"). Returns
+\(TEX-STRING . IS-ERROR), same shape as `abella-mcp-call-tool'.
+abella2tex is stateless (no session_id), so no session bookkeeping is
+needed here.
+
+Always requests \"macros\" (a \\newcommand preamble for every macro the
+notation configuration(s) declare -- including abella2tex's own
+built-in \\rel/\\ktype/\\abella/\\ind/\\coind, which every rendering uses)
+so the returned string is self-contained: MathJax (via math-preview)
+has no preamble of its own and errors on an undefined control sequence
+otherwise. Verified directly against math-preview's daemon that a
+\\newcommand block placed ahead of the math content in the same \"tex\"
+payload is processed correctly, so this is simpler and more robust
+than trying to register the macros with math-preview itself
+(`math-preview-tex-macros' is baked into its daemon process's startup
+arguments, not sent per-request, so using it here would mean
+restarting that shared daemon on every notation-config change)."
+  (let ((source (if (equal mode "commands") source (abella-tex--strip-header source))))
+    (abella-mcp-call-tool
+     "abella2tex"
+     `((source . ,source)
+       (mode . ,mode)
+       (configs . ,(abella-tex--configs-arg))
+       (macros . t)
+       ;; This ONLY suppresses "term" mode's own \[ \] wrapper --
+       ;; "commands" mode ignores it and wraps a lone Kind/Type/Theorem
+       ;; in \[ \] unconditionally regardless (confirmed empirically);
+       ;; `abella-tex--unwrap-display' strips that back off, since \[ \]
+       ;; are text-mode-only LaTeX display-math delimiters, invalid as
+       ;; literal content once math-preview is already treating the
+       ;; whole payload as math (MathJax errors "Undefined control
+       ;; sequence \[" otherwise).
+       (display . :false)))))
+
+(defun abella-tex--unwrap-display (rendered)
+  "Post-process RENDERED (a \\newcommand macros preamble, a blank line,
+then the body -- `abella-tex--render' always requests macros) into
+\(TEX . WARNING\): TEX is a string ready to hand to math-preview, or nil
+if there is nothing to preview; WARNING is abella2tex's own trailing
+diagnostic (e.g. an unused configured symbol, or a variable-naming
+collision the rendering would introduce -- see the abella2tex tool's
+own description), if RENDERED carried one, else nil.
+
+Three things RENDERED can carry that math-preview/MathJax cannot
+accept as literal math content:
+- A trailing warning line. abella-mcp's abella2tex tool appends any
+  diagnostic AFTER the actual rendering (\"OUT ^ warnings\" in
+  tex_tool.real.ml); every abella2tex warning, in turn, is printed via
+  the one shared `Diag.warn'/`warn_once' (lib/diag.ml in the abella2tex
+  project), which always prefixes it \"abella2tex: warning: \" -- a
+  fixed, reliable marker for exactly where the real rendering ends and
+  the warning begins. Concretely, THIS was why some declarations
+  \(e.g. a Define using several notation-config symbols the rest of a
+  small snippet doesn't happen to use\) silently failed to render: the
+  English-language warning text was being submitted to MathJax right
+  along with the real TeX, which cannot parse it.
+- A wrapping \\[ ... \\] (\"commands\" mode's unconditional formatting
+  for a lone Kind/Type/Theorem, regardless of the \"display\" flag --
+  see `abella-tex--render'), which is stripped back off.
+- Empty content (abella2tex's \"commands\" mode silently renders
+  nothing for a declaration it has no math form for, e.g.
+  Import/Specification/Set/Close), reported as a nil TEX so the caller
+  can say so instead of submitting a blank/macros-only image.
+A no-op for content that has none of these, e.g. \"term\" mode's own
+already-bare output, or Define/CoDefine's
+\\begin{align*}...\\end{align*}."
+  (let* ((wpos (string-match "^abella2tex: warning: " rendered))
+         (warning (and wpos (string-trim (substring rendered wpos))))
+         (rendered (if wpos (substring rendered 0 wpos) rendered))
+         (sep (string-match "\n\n" rendered))
+         (macros (if sep (substring rendered 0 sep) ""))
+         (body (string-trim (if sep (substring rendered (match-end 0)) rendered))))
+    (when (string-match "\\`\\\\\\[\\(\\(?:.\\|\n\\)*\\)\\\\\\]\\'" body)
+      (setq body (string-trim (match-string 1 body))))
+    (cons (unless (string-empty-p body) (concat macros "\n\n" body)) warning)))
+
+;; ------------------------------------------------------------------
+;; math-preview backend
+;; ------------------------------------------------------------------
+
+(defun abella-tex--start-math-preview ()
+  "Ensure the math-preview daemon is running, or report why it couldn't
+be started (e.g. the Node.js CLI isn't installed) without raising."
+  (condition-case err
+      (progn (math-preview-start-process) t)
+    (error (message "abella-tex: could not start math-preview: %s" (error-message-string err)) nil)))
+
+(defun abella-tex--show (beg end tex)
+  "Render TEX as an inline image over [BEG, END) in the current buffer
+via math-preview."
+  (when (abella-tex--start-math-preview)
+    (math-preview--submit beg end tex "tex" nil)))
+
+(defun abella-tex--clear (beg end)
+  "Remove any math-preview overlay(s) covering [BEG, END) in the current
+buffer. Returns non-nil if anything was removed."
+  (let ((ovs (math-preview--overlays beg end)))
+    (dolist (ov ovs) (delete-overlay ov))
+    (and ovs t)))
+
+(defun abella-tex--render-and-show (source mode beg end &optional quiet)
+  "Render SOURCE under MODE via `abella-tex--render' and show it over
+[BEG, END) in the current buffer via `abella-tex--show', or `message'
+why not: a tool error, nothing to preview, or a warning abella2tex
+reported alongside an otherwise-successful rendering (see
+`abella-tex--unwrap-display') -- unless QUIET, which silently skips
+all three instead (used when rendering many hypotheses/goals or
+transcript entries at once, where messaging per one would be noisy --
+the same notation-config warning, in particular, tends to repeat
+near-identically for every declaration in a file, since each only uses
+a handful of a whole config's symbols)."
+  (let ((result (abella-tex--render source mode)))
+    (if (cdr result)
+        (unless quiet (message "abella2tex: %s" (car result)))
+      (let* ((unwrapped (abella-tex--unwrap-display (car result)))
+             (tex (car unwrapped)) (warning (cdr unwrapped)))
+        (when (and warning (not quiet)) (message "%s" warning))
+        (if (not tex)
+            (unless quiet (message "abella-tex: nothing to preview here."))
+          (abella-tex--show beg end tex))))))
+
+;; ------------------------------------------------------------------
+;; Parsing a full proof-state display in the output buffer
+;; ------------------------------------------------------------------
+
+(defun abella-tex--hyp-name (line)
+  "Elisp port of abella-mcp's bin/proof_state.ml `hyp_name': if LINE
+\(assumed not indented\) looks like a hypothesis's opening line
+\"NAME : ...\", return (NAME . FORMULA-COLUMN) -- FORMULA-COLUMN is
+LINE's 0-based column where the formula text itself starts, right
+after \": \" -- else nil."
+  (let ((i (cl-position ?: line)))
+    (when (and i (> i 0) (< (1+ i) (length line))
+               (eq (aref line (1- i)) ?\s) (eq (aref line (1+ i)) ?\s))
+      (let ((name (string-trim (substring line 0 (1- i)))))
+        (when (and (> (length name) 0) (string-match-p "\\`[A-Za-z0-9_']+\\'" name))
+          (cons name (+ i 2)))))))
+
+(defun abella-tex--render-state-in-buffer (beg)
+  "In the current buffer -- assumed to be the *abella:...* output buffer,
+just filled with a full proof-state display by `abella--show-live-state'
+over [BEG, `point-max') (a sub-region at the tail of the buffer,
+following whatever persistent event log precedes it -- never the whole
+buffer, unlike the command-transcript case) -- render each hypothesis's
+formula and the goal as TeX in place, via `abella-tex--render-and-show'.
+A no-op if [BEG, `point-max') doesn't actually hold a state (no \"====\"
+separator line is found -- e.g. \"(no proof state; at top level)\"), so
+this is always safe to call on whatever that region currently shows.
+
+A line-based re-implementation of abella-mcp's own
+bin/proof_state.ml parser (`hyp_name', `is_indented', `is_separator'),
+operating on the buffer directly (rather than a string, the way
+abella-mcp's own Elisp side reads proof states elsewhere) since
+overlays need real buffer positions to anchor to."
+  (goto-char beg)
+  (let (hyps cur-name cur-beg)
+    (while (and (not (eobp)) (not (looking-at "=+[ \t]*$")))
+      (let* ((bol (line-beginning-position)) (eol (line-end-position))
+             (line (buffer-substring-no-properties bol eol))
+             (indented (or (string-prefix-p " " line) (string-prefix-p "\t" line)))
+             (parsed (unless indented (abella-tex--hyp-name line))))
+        (cond
+         (parsed
+          (when cur-name (push (list cur-name cur-beg bol) hyps))
+          (setq cur-name (car parsed) cur-beg (+ bol (cdr parsed))))
+         ((and cur-name (not indented))
+          ;; a non-indented, non-hypothesis line (a "Subgoal ..:"
+          ;; header, "Variables: ...", or a message) ends the block
+          (push (list cur-name cur-beg bol) hyps)
+          (setq cur-name nil))
+         (t nil)))
+      (forward-line 1))
+    (when cur-name (push (list cur-name cur-beg (point)) hyps))
+    (setq hyps (nreverse hyps))
+    (when (looking-at "=+[ \t]*$")
+      (forward-line 1)
+      (let* ((goal-beg (point))
+             (goal-end (if (re-search-forward "^[ \t]*Subgoal .+ is:\\|^\\[session: " nil t)
+                           (line-beginning-position)
+                         (point-max))))
+        (goto-char goal-end)
+        (skip-chars-backward " \t\n")
+        (setq goal-end (point))
+        (dolist (h hyps)
+          (let ((name (nth 0 h)) (beg (nth 1 h)) (end (nth 2 h)))
+            (ignore name)
+            (save-excursion
+              (goto-char end)
+              (skip-chars-backward " \t\n")
+              (setq end (point)))
+            (when (> end beg)
+              (abella-tex--render-and-show
+               (buffer-substring-no-properties beg end) "term" beg end t))))
+        (when (> goal-end goal-beg)
+          (abella-tex--render-and-show
+           (buffer-substring-no-properties goal-beg goal-end) "term" goal-beg goal-end t))))))
+
+;; ------------------------------------------------------------------
+;; Rendering persistent session events in the output buffer
+;; ------------------------------------------------------------------
+
+(defun abella-tex--declaration-mode (kw)
+  "The abella2tex MODE to render a top-level command starting with
+keyword KW under: \"term\" for Theorem/Query, whose own \"display\"
+flag actually suppresses \\[ \\] wrapping (so no post-processing is
+needed for these, unlike the below); \"commands\" for everything else
+\(Kind, Type, Define, CoDefine, ... -- none of these have a
+term/clauses-mode equivalent; Kind/Type in particular are not \"a
+term\" at all, grammatically\), whose own header-parsing makes
+`abella-tex--strip-header' unnecessary, but whose lone-Kind/Type
+wrapping and empty output for non-renderable commands (Import/
+Specification/Set/Close, or -- for a failed event -- whatever tactic
+or malformed text Abella itself rejected) both need
+`abella-tex--unwrap-display' afterward -- see `abella-tex--render-and-show',
+which every caller of this function goes through."
+  (if (member kw '("Theorem" "Query")) "term" "commands"))
+
+(defun abella-tex--render-events-in-buffer (events)
+  "In the current buffer -- assumed to be the *abella:...* output
+buffer, into which EVENTS (abella-mcp.el's `abella-event' structs, in
+order) were just appended by `abella--append-events' -- render each
+event's own `abella-event-command' (its clean source text, straight
+from the source buffer, not abella_mcp's comment-stripped echo) as TeX
+in place, via `abella-tex--render-and-show', over just its own
+\"> \" + `abella-event-raw' span: from its own
+`abella-event-output-marker' to exactly `abella-event-raw's own
+length past it -- NOT all the way to the next event (or `point-max'),
+which would swallow the blank-line separator `abella--event-text'
+\(abella-mcp.el\) puts after every event, and any warning lines it
+carries, into the image's own replaced region: the separator would
+disappear entirely (two rendered commands running together with no
+break), and warnings -- important, meant to stay legible -- would be
+hidden inside an image instead of left as plain text below it.
+
+For a Theorem/Split event, COMMAND is only its statement -- the image
+still replaces the display of its *whole* raw span, tactics and all
+(a tactic-by-tactic play-by-play isn't something abella2tex can render
+anyway), just not the separator/warnings after it; the underlying text
+is untouched regardless, so it's still there, unrendered, the moment
+this preview is toggled off. A failed event's own command is rendered
+the same uniform way -- `abella-tex--render-and-show' already degrades
+quietly (no image) if abella2tex can't make sense of it, exactly like
+any other non-renderable declaration."
+  (dolist (ev events)
+    (let* ((beg (marker-position (abella-event-output-marker ev)))
+           (end (+ beg 2 (length (abella-event-raw ev))))) ; "> " + raw
+      (abella-tex--render-and-show
+       (abella-event-command ev) (abella-tex--declaration-mode (abella-event-kind ev))
+       beg end t))))
+
+;; ------------------------------------------------------------------
+;; Toggle command
+;; ------------------------------------------------------------------
+
+(defvar-local abella-tex--render-output-p nil
+  "Non-nil while `abella-tex-toggle-preview' has this buffer's Abella
+session set to show every future output-buffer display -- a full proof
+state (every hypothesis and the goal) or a command transcript (each
+top-level command echoed there) alike -- rendered as TeX in its
+*abella:...* output buffer, rather than as plain Abella syntax.")
+
+(defun abella-tex--after-show-live-state (text)
+  "`:after' advice on `abella--show-live-state' (abella-mcp.el): if
+this buffer's `abella-tex--render-output-p' is on, render TEXT (the
+full proof state just shown, live, while a proof is open) as TeX over
+the live-state region it now occupies -- from this buffer's own
+`abella--live-state-marker' to the output buffer's end, the whole of
+which TEXT alone now fills (`abella--show-live-state' always clears any
+previous live-state region first). Runs with `current-buffer' back to
+this Abella source buffer, exactly like the advice this replaces (see
+`abella-tex--after-append-events')."
+  (ignore text)
+  (when (and abella-tex--render-output-p
+             abella--live-state-marker (marker-buffer abella--live-state-marker))
+    (let ((marker abella--live-state-marker))
+      (with-current-buffer (marker-buffer marker)
+        (abella-tex--render-state-in-buffer (marker-position marker))))))
+
+(advice-add 'abella--show-live-state :after #'abella-tex--after-show-live-state)
+
+(defun abella-tex--after-append-events (new-events)
+  "`:after' advice on `abella--append-events' (abella-mcp.el): if this
+buffer's `abella-tex--render-output-p' is on, render each of NEW-EVENTS
+as TeX in place, over its own now-displayed span, via
+`abella-tex--render-events-in-buffer'. Runs with `current-buffer' back
+to this Abella source buffer (`abella--append-events's own
+`with-current-buffer' into the output buffer has already unwound by
+the time `:after' advice runs), so `abella-tex--render-output-p' is
+read from the right place without needing to pass it explicitly."
+  (when (and abella-tex--render-output-p new-events)
+    (with-current-buffer (abella-output-buffer-name)
+      (abella-tex--render-events-in-buffer new-events))))
+
+(advice-add 'abella--append-events :after #'abella-tex--after-append-events)
+
+(defun abella-tex--preview-region-in-output (beg end)
+  "Render the region [BEG, END) as a bare term and show it in the
+output buffer, replacing whatever it currently shows. An ad hoc,
+one-shot preview -- not tied to `abella-tex--render-output-p', and not
+reverted by a later `abella-tex-toggle-preview' call the way the
+persistent state rendering is, since the output buffer's content is
+already routinely replaced by ordinary Abella activity."
+  (let* ((source (buffer-substring-no-properties beg end))
+         (result (abella-tex--render source "term")))
+    (with-current-buffer (get-buffer-create (abella-output-buffer-name))
+      (unless (derived-mode-p 'abella-output-mode) (abella-output-mode))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (cond
+         ((cdr result) (insert (format "abella2tex error: %s" (car result))))
+         (t (let* ((unwrapped (abella-tex--unwrap-display (car result)))
+                    (tex (car unwrapped)) (warning (cdr unwrapped)))
+              (cond
+               (tex (insert "  ") (abella-tex--show (point-min) (point-max) tex))
+               (t (insert "(nothing to preview)")))
+              (when warning (insert "\n\n" warning)))))
+        (goto-char (point-min))))
+    (display-buffer (abella-output-buffer-name)
+                     '(display-buffer-reuse-window (inhibit-same-window . t)))))
+
+(defun abella-tex-toggle-preview ()
+  "With an active region, render exactly the selected text as a bare
+term and show it in the *abella:...* output buffer (a one-shot
+preview, replacing whatever the output buffer currently shows).
+
+Otherwise, toggle whether this buffer's Abella session shows every
+future output-buffer display -- a full proof state or a command
+transcript alike, in the output buffer, never this source buffer --
+rendered as TeX (goal and every hypothesis, separately, for a state;
+each top-level command, for a transcript) instead of as plain Abella
+syntax. Turning it back off only removes the images; the plain text
+underneath was never touched, so it reappears immediately."
+  (interactive)
+  (unless abella-tex--math-preview-available
+    (user-error "math-preview is not installed (MELPA); install it to enable LaTeX previews"))
+  (if (use-region-p)
+      (abella-tex--preview-region-in-output (region-beginning) (region-end))
+    (setq abella-tex--render-output-p (not abella-tex--render-output-p))
+    (if abella-tex--render-output-p
+        (progn
+          ;; Render whatever the output buffer already shows, the same
+          ;; way `abella-tex--after-show-live-state'/
+          ;; `abella-tex--after-append-events' render it going forward:
+          ;; the live-state region, if a proof is currently open --
+          (when (and abella--live-state-marker (marker-buffer abella--live-state-marker))
+            (let ((marker abella--live-state-marker))
+              (with-current-buffer (marker-buffer marker)
+                (abella-tex--render-state-in-buffer (marker-position marker)))))
+          ;; -- and every already-finalized event, oldest first (matching
+          ;; buffer/display order; `abella-events' itself is newest first).
+          (when abella-events
+            (with-current-buffer (abella-output-buffer-name)
+              (abella-tex--render-events-in-buffer (reverse abella-events))))
+          (message "abella-tex: output rendering on"))
+      (when (get-buffer (abella-output-buffer-name))
+        (with-current-buffer (abella-output-buffer-name)
+          (abella-tex--clear (point-min) (point-max))))
+      (message "abella-tex: output rendering off"))))
+
+(define-key abella-mode-keymap (kbd "C-c C-l") #'abella-tex-toggle-preview)
+
+(provide 'abella-tex)
