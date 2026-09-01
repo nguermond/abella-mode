@@ -194,15 +194,14 @@ restarting that shared daemon on every notation-config change)."
        (mode . ,mode)
        (configs . ,configs)
        (macros . t)
-       ;; This ONLY suppresses "term" mode's own \[ \] wrapper --
-       ;; "commands" mode ignores it and wraps a lone Kind/Type/Theorem
-       ;; in \[ \] unconditionally regardless (confirmed empirically);
-       ;; `abella-tex--unwrap-display' strips that back off, since \[ \]
-       ;; are text-mode-only LaTeX display-math delimiters, invalid as
-       ;; literal content once math-preview is already treating the
-       ;; whole payload as math (MathJax errors "Undefined control
-       ;; sequence \[" otherwise).
-       (display . :false)))))
+       ;; For "term" mode, this asks abella2tex to wrap a long statement
+       ;; across several aligned rows instead of leaving it one
+       ;; unbroken line (Render.wrapped_term, abella2tex lib/render.ml
+       ;; -- as of abella2tex 0.1.4, "term" mode's own wrapping carries
+       ;; no \[ \] delimiter, unlike "commands" mode's unconditional
+       ;; wrapping of a lone Kind/Type/Theorem, which still needs
+       ;; `abella-tex--unwrap-display' to strip one).
+       (display . t)))))
 
 (defun abella-tex--unwrap-display (rendered)
   "Post-process RENDERED (a \\newcommand macros preamble, a blank line,
@@ -459,8 +458,22 @@ defensive only; shouldn't happen for a real Define/CoDefine."
   (if (string-match "\\`\\\\begin{align\\*}\n" body)
       (concat (substring body 0 (match-end 0))
               "  &" heading-row " \\\\\n"
-              (substring body (match-end 0)))
+              (abella-tex--indent-clause-rows (substring body (match-end 0))))
     (concat "\\begin{array}{l}\n" heading-row " \\\\\n" body "\n\\end{array}")))
+
+(defun abella-tex--indent-clause-rows (rows)
+  "ROWS is a Define/CoDefine event's own align* clause rows (everything
+after the opening \\begin{align*} line, through and including the
+closing \\end{align*} line) -- abella2tex's `clauses' (lib/render.ml)
+always opens a clause's first line with \"  &\" and any of its own
+wrapped continuation lines with \"  &\\quad \". Indenting every such
+line one further \\quad, here, makes the clauses read as nested under
+the \"Define ... by\" heading `abella-tex--splice-align-heading' has
+just spliced in above them as an unindented row of its own, reusing
+abella2tex's own wrap-indent convention rather than inventing a new
+one. The closing \\end{align*} line has no leading \"  &\" and so is
+left untouched."
+  (replace-regexp-in-string "^  &" "  &\\\\quad " rows))
 
 (defun abella-tex--header-to-type-command (name type)
   "The bare \"Type NAME TYPE.\" command for one (NAME . TYPE) pair off a
@@ -528,6 +541,12 @@ the output buffer to actually render the live state; see
      (abella-event-decl abella--pending-theorem)
      (abella-event-kind abella--pending-theorem))))
 
+(defconst abella-tex--error-marker-tex "\\color{red}{\\textbf{[error]}}"
+  "TeX shown, via `abella-tex--show', in place of a failed event's own
+rendering -- see `abella-tex--render-event-and-show'. \"color\" is
+already one of `math-preview-tex-default-packages', so this needs no
+extra MathJax configuration.")
+
 (defun abella-tex--render-event-and-show (ev configs beg end)
   "Render one event EV -- see `abella-tex--render-events-in-buffer',
 which calls this once per event -- and show it over [BEG, END), same
@@ -539,49 +558,60 @@ event's whole span (so the underlying plain source text, heading
 included, is always what reappears the instant rendering is toggled
 off -- nothing here ever touches real buffer text, only overlay
 `display' properties, exactly like every other renderer in this file).
-Any tool error or empty rendering is skipped silently, same as
-`abella-tex--render-and-show' with QUIET -- the only mode events are
-ever rendered in (see `abella-tex--render-events-in-buffer').
+
+An event whose `abella-event-status' is `error' never reaches
+abella2tex at all -- its own `command'/`raw' is whatever Abella itself
+rejected, not necessarily parseable source -- and instead gets
+`abella-tex--error-marker-tex' shown over its whole span, so a failed
+command reads as a deliberate inline marker in tex mode rather than
+silently falling back to plain, unrendered text (easy to mistake for
+\"not yet toggled on\").
+
+For any other event, a tool error or empty rendering is skipped
+silently, same as `abella-tex--render-and-show' with QUIET -- the only
+mode events are ever rendered in (see `abella-tex--render-events-in-buffer').
 
 For a Theorem/Query event with a `decl', the BODY render itself uses
 `abella-theorem-decl-statement' instead of the raw `command' -- already
 exactly the header-stripped text `abella-tex--strip-header' would
 otherwise re-derive from `command', so this skips that redundant
 reparse; falls back to `command' unchanged if `decl' is ever nil."
-  (let* ((command (abella-event-command ev))
-         (kind (abella-event-kind ev))
-         (decl (abella-event-decl ev))
-         (mode (abella-tex--declaration-mode kind))
-         (source (if (and decl (member kind '("Theorem" "Query")))
-                     (abella-theorem-decl-statement decl)
-                   command))
-         (result (abella-tex--render source mode configs)))
-    (unless (cdr result)
-      (let ((tex (car (abella-tex--unwrap-display (car result)))))
-        (when tex
-          (let* ((split (abella-tex--split-macros tex))
-                 (macros (car split)) (body (cdr split))
-                 (combined
-                  (cond
-                   ((member kind '("Define" "CoDefine"))
-                    (let ((heading (abella-tex--render-define-heading decl kind configs)))
-                      (if heading (abella-tex--splice-align-heading body heading) body)))
-                   ((member kind '("Theorem" "Query"))
-                    (concat "\\begin{array}{l}\n"
-                            (abella-tex--theorem-heading-row decl kind) " \\\\\n"
-                            body "\n\\end{array}"))
-                   ((member kind '("Kind" "Type"))
-                    ;; Unlike Define/CoDefine, a Kind/Type declaration's
-                    ;; own BODY -- via abella2tex's "commands" mode -- is
-                    ;; already the complete bare rendering (e.g.
-                    ;; "\rel{lvl} : \rel{tm} \to \rel{ord} \to \rel{prop}"
-                    ;; for "Type lvl  tm -> ord -> prop."), with no
-                    ;; separate clause list below it the way a Define
-                    ;; has -- so the keyword is just prefixed directly,
-                    ;; no splicing/wrapping/second abella2tex call needed.
-                    (concat "\\text{" kind " }" body))
-                   (t body))))
-            (abella-tex--show beg end (concat macros "\n\n" combined))))))))
+  (if (eq (abella-event-status ev) 'error)
+      (abella-tex--show beg end abella-tex--error-marker-tex)
+    (let* ((command (abella-event-command ev))
+           (kind (abella-event-kind ev))
+           (decl (abella-event-decl ev))
+           (mode (abella-tex--declaration-mode kind))
+           (source (if (and decl (member kind '("Theorem" "Query")))
+                       (abella-theorem-decl-statement decl)
+                     command))
+           (result (abella-tex--render source mode configs)))
+      (unless (cdr result)
+        (let ((tex (car (abella-tex--unwrap-display (car result)))))
+          (when tex
+            (let* ((split (abella-tex--split-macros tex))
+                   (macros (car split)) (body (cdr split))
+                   (combined
+                    (cond
+                     ((member kind '("Define" "CoDefine"))
+                      (let ((heading (abella-tex--render-define-heading decl kind configs)))
+                        (if heading (abella-tex--splice-align-heading body heading) body)))
+                     ((member kind '("Theorem" "Query"))
+                      (concat "\\begin{array}{l}\n"
+                              (abella-tex--theorem-heading-row decl kind) " \\\\\n"
+                              body "\n\\end{array}"))
+                     ((member kind '("Kind" "Type"))
+                      ;; Unlike Define/CoDefine, a Kind/Type declaration's
+                      ;; own BODY -- via abella2tex's "commands" mode -- is
+                      ;; already the complete bare rendering (e.g.
+                      ;; "\rel{lvl} : \rel{tm} \to \rel{ord} \to \rel{prop}"
+                      ;; for "Type lvl  tm -> ord -> prop."), with no
+                      ;; separate clause list below it the way a Define
+                      ;; has -- so the keyword is just prefixed directly,
+                      ;; no splicing/wrapping/second abella2tex call needed.
+                      (concat "\\text{" kind " }" body))
+                     (t body))))
+              (abella-tex--show beg end (concat macros "\n\n" combined)))))))))
 
 (defun abella-tex--render-events-in-buffer (events configs)
   "In the current buffer -- assumed to be the *abella:...* output
@@ -592,28 +622,46 @@ from the source buffer, not abella_mcp's comment-stripped echo) as TeX
 in place, via `abella-tex--render-event-and-show' (using CONFIGS --
 see `abella-tex--render-and-show'; the caller must resolve this from
 the Abella source buffer, not this output buffer), over just its own
-\"> \" + `abella-event-raw' span: from its own
-`abella-event-output-marker' to exactly `abella-event-raw's own
-length past it -- NOT all the way to the next event (or `point-max'),
-which would swallow the blank-line separator `abella--event-text'
-\(abella-mcp.el\) puts after every event, and any warning lines it
-carries, into the image's own replaced region: the separator would
-disappear entirely (two rendered commands running together with no
-break), and warnings -- important, meant to stay legible -- would be
-hidden inside an image instead of left as plain text below it.
+\"> \" + `abella-event-raw' span, MINUS `abella-event-raw's own
+trailing newline: from its own `abella-event-output-marker' to one
+character short of `abella-event-raw's own length past it -- NOT all
+the way to the next event (or `point-max'), which would swallow the
+blank-line separator `abella--event-text' (abella-mcp.el) puts after
+every event, and any warning lines it carries, into the image's own
+replaced region: the separator would disappear entirely (two rendered
+commands running together with no break), and warnings -- important,
+meant to stay legible -- would be hidden inside an image instead of
+left as plain text below it.
+
+The one-character trim matters for the very same reason: a `display'
+overlay swallows any newline it spans instead of still breaking the
+line there (verified directly -- an overlay covering \"AB\\n\" with a
+one-line `display' value renders glued to whatever follows on the SAME
+screen line, one fewer screen line overall than the buffer's raw text
+would suggest). `send_commands' (abella_mcp's bin/abella_mcp.ml) builds
+every transcript entry via \"> %s\\n%s\\n\", so `abella-event-raw'
+always ends in exactly one \"\\n\" of its own; covering it here would
+eat the only newline standing between this image and whatever
+`abella--event-text' put right after it (a warning line, or -- with no
+warnings -- the first half of its own trailing blank-line separator),
+collapsing what should be a full blank-line gap between two
+consecutively-rendered events down to a single, cramped line break.
+Excluding it leaves that newline, and `abella--event-text's own outer
+one, both real and uncovered, restoring the same blank-line gap plain
+(non-tex) mode already has.
 
 For a Theorem/Split event, COMMAND is only its statement -- the image
 still replaces the display of its *whole* raw span, tactics and all
 (a tactic-by-tactic play-by-play isn't something abella2tex can render
 anyway), just not the separator/warnings after it; the underlying text
 is untouched regardless, so it's still there, unrendered, the moment
-this preview is toggled off. A failed event's own command is rendered
-the same uniform way -- `abella-tex--render-event-and-show' already
-degrades quietly (no image) if abella2tex can't make sense of it,
-exactly like any other non-renderable declaration."
+this preview is toggled off. A failed event is rendered the same
+uniform way, span-wise, but see `abella-tex--render-event-and-show''s
+own `abella-event-status' branch for what actually gets shown there."
   (dolist (ev events)
     (let* ((beg (marker-position (abella-event-output-marker ev)))
-           (end (+ beg 2 (length (abella-event-raw ev))))) ; "> " + raw
+           ;; "> " + raw, minus raw's own trailing "\n" -- see above.
+           (end (+ beg 2 (1- (length (abella-event-raw ev))))))
       (abella-tex--render-event-and-show ev configs beg end))))
 
 ;; ------------------------------------------------------------------
