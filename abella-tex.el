@@ -94,6 +94,46 @@ unset, from `abella-tex--auto-notation-config'."
                         (and auto (list auto))))))
     (vconcat (mapcar (lambda (p) (expand-file-name p default-directory)) configs))))
 
+;; ------------------------------------------------------------------
+;; Buffer-based header stripping for the ad hoc region-selection
+;; preview (`abella-tex--preview-region-in-output'), the one remaining
+;; case with no `abella-event'/`decl' behind it at all -- just
+;; arbitrary selected text, so there is no structured info to read and
+;; this still has to parse. Operates on a real (temp) buffer with
+;; `abella-mode-syntax-table' active, via `abella-skip-whitespace-and-
+;; comments' (abella.el) -- the same primitive `abella-mcp--parse-decl'
+;; and friends (abella-mcp.el) now use to build EVERY event's own
+;; structured `decl' at creation time, straight off real source-buffer
+;; positions; this file no longer re-derives name/type from a detached
+;; `abella-event-command' string the way it used to (see
+;; `abella-tex--render-define-heading'/`abella-tex--theorem-heading-
+;; row', below, which just read `decl' fields directly now).
+
+(defun abella-tex--looking-at-keyword-p (keyword)
+  "Non-nil if point is at KEYWORD as a whole word in the current
+buffer. On a match, also moves point past KEYWORD and any following
+noise (`abella-skip-whitespace-and-comments', abella.el); leaves point
+untouched otherwise, so callers can try several keywords in sequence
+at the same position via `or'."
+  (when (looking-at (concat "\\<" (regexp-quote keyword) "\\>"))
+    (goto-char (match-end 0))
+    (abella-skip-whitespace-and-comments)
+    t))
+
+(defun abella-tex--with-command-buffer (command fn)
+  "Call FN with point at the start of a temp buffer containing COMMAND,
+`abella-mode-syntax-table' active (so `forward-comment' -- and hence
+`abella-skip-whitespace-and-comments'/`abella-tex--looking-at-keyword-p'
+-- treats COMMAND's comments exactly as the real source buffer would)
+and `case-fold-search' nil (Abella's keywords are case-sensitive, e.g.
+`Split' the command vs. `split' the tactic). Returns FN's own value."
+  (with-temp-buffer
+    (insert command)
+    (set-syntax-table abella-mode-syntax-table)
+    (let ((case-fold-search nil))
+      (goto-char (point-min))
+      (funcall fn))))
+
 (defun abella-tex--strip-header (s)
   "Strip a leading Abella top-level header from S, so a statement or
 clause list pasted straight from a .thm file parses as a bare
@@ -105,23 +145,35 @@ reading the abella-mcp source that its abella2tex *tool* does NOT do
 this itself despite its docstring implying it does (tex_tool.real.ml
 calls Pipeline.render directly on the given source with no such step),
 so this has to happen here instead."
-  (with-syntax-table abella-mode-syntax-table
-    (let* ((case-fold-search nil)
-           (s (string-trim s)))
+  (string-trim
+   (abella-tex--with-command-buffer
+    s
+    (lambda ()
+      (abella-skip-whitespace-and-comments)
       (cond
-       ((string-match "\\`\\<\\(?:Theorem\\|Lemma\\)\\>" s)
-        (if (string-match ":" s) (substring s (1+ (match-beginning 0))) s))
-       ((string-match "\\`\\<\\(?:Define\\|CoDefine\\)\\>" s)
-        (if (string-match "\\<by\\>" s) (substring s (match-end 0)) s))
-       ((string-match "\\`\\<Query\\>" s) (substring s (match-end 0)))
-       (t s)))))
+       ((or (abella-tex--looking-at-keyword-p "Theorem")
+            (abella-tex--looking-at-keyword-p "Lemma"))
+        (if (re-search-forward ":" nil t)
+            (buffer-substring-no-properties (point) (point-max))
+          (buffer-substring-no-properties (point-min) (point-max))))
+       ((or (abella-tex--looking-at-keyword-p "Define")
+            (abella-tex--looking-at-keyword-p "CoDefine"))
+        (if (re-search-forward "\\<by\\>" nil t)
+            (buffer-substring-no-properties (point) (point-max))
+          (buffer-substring-no-properties (point-min) (point-max))))
+       ((abella-tex--looking-at-keyword-p "Query")
+        (buffer-substring-no-properties (point) (point-max)))
+       (t (buffer-substring-no-properties (point-min) (point-max))))))))
 
-(defun abella-tex--render (source mode)
+(defun abella-tex--render (source mode configs)
   "Render SOURCE (Abella source syntax) to TeX via abella_mcp's abella2tex
-tool, under MODE (\"term\", \"clauses\", or \"commands\"). Returns
-\(TEX-STRING . IS-ERROR), same shape as `abella-mcp-call-tool'.
-abella2tex is stateless (no session_id), so no session bookkeeping is
-needed here.
+tool, under MODE (\"term\", \"clauses\", or \"commands\"), using CONFIGS
+(a vector as built by `abella-tex--configs-arg' -- the caller's job to
+compute, in whatever buffer is actually the right one to resolve
+`abella-tex-notation-configs'/`notation.conf' against; see the note on
+`abella-tex--render-and-show'). Returns \(TEX-STRING . IS-ERROR), same
+shape as `abella-mcp-call-tool'. abella2tex is stateless (no
+session_id), so no session bookkeeping is needed here.
 
 Always requests \"macros\" (a \\newcommand preamble for every macro the
 notation configuration(s) declare -- including abella2tex's own
@@ -140,7 +192,7 @@ restarting that shared daemon on every notation-config change)."
      "abella2tex"
      `((source . ,source)
        (mode . ,mode)
-       (configs . ,(abella-tex--configs-arg))
+       (configs . ,configs)
        (macros . t)
        ;; This ONLY suppresses "term" mode's own \[ \] wrapper --
        ;; "commands" mode ignores it and wraps a lone Kind/Type/Theorem
@@ -218,18 +270,40 @@ buffer. Returns non-nil if anything was removed."
     (dolist (ov ovs) (delete-overlay ov))
     (and ovs t)))
 
-(defun abella-tex--render-and-show (source mode beg end &optional quiet)
-  "Render SOURCE under MODE via `abella-tex--render' and show it over
-[BEG, END) in the current buffer via `abella-tex--show', or `message'
-why not: a tool error, nothing to preview, or a warning abella2tex
-reported alongside an otherwise-successful rendering (see
-`abella-tex--unwrap-display') -- unless QUIET, which silently skips
-all three instead (used when rendering many hypotheses/goals or
-transcript entries at once, where messaging per one would be noisy --
-the same notation-config warning, in particular, tends to repeat
-near-identically for every declaration in a file, since each only uses
-a handful of a whole config's symbols)."
-  (let ((result (abella-tex--render source mode)))
+(defun abella-tex--render-and-show (source mode configs beg end &optional quiet heading)
+  "Render SOURCE under MODE (with CONFIGS -- see `abella-tex--render')
+via `abella-tex--render' and show it over [BEG, END) in the current
+buffer via `abella-tex--show', or `message' why not: a tool error,
+nothing to preview, or a warning abella2tex reported alongside an
+otherwise-successful rendering (see `abella-tex--unwrap-display') --
+unless QUIET, which silently skips all three instead (used when
+rendering many hypotheses/goals or transcript entries at once, where
+messaging per one would be noisy -- the same notation-config warning,
+in particular, tends to repeat near-identically for every declaration
+in a file, since each only uses a handful of a whole config's
+symbols).
+
+CONFIGS is always passed in by the caller rather than computed here
+via `abella-tex--configs-arg', because this function -- like
+`abella-tex--render-state-in-buffer' and
+`abella-tex--render-events-in-buffer' below it -- typically runs with
+`current-buffer' switched to the *abella:...* output buffer (never
+visiting a file, so `buffer-file-name' is nil there and
+`abella-tex--auto-notation-config' silently finds nothing): the
+caller must resolve CONFIGS earlier, while `current-buffer' is still
+the Abella source buffer whose directory/`abella-tex-notation-configs'
+actually apply.
+
+HEADING, if non-nil, is a bare TeX math-mode fragment (see
+`abella-tex--theorem-heading-row') spliced in above SOURCE's own
+rendering, both wrapped together in one array as the single image
+placed over [BEG, END) -- used by `abella-tex--render-state-in-buffer'
+to show the currently open theorem's own \"Theorem NAME:\" heading
+above the first hypothesis (or the goal, if there are none) of the
+live proof state, since that state has no \"event\" of its own for
+`abella-tex--render-event-and-show''s heading handling to attach to
+until the proof closes."
+  (let ((result (abella-tex--render source mode configs)))
     (if (cdr result)
         (unless quiet (message "abella2tex: %s" (car result)))
       (let* ((unwrapped (abella-tex--unwrap-display (car result)))
@@ -237,7 +311,13 @@ a handful of a whole config's symbols)."
         (when (and warning (not quiet)) (message "%s" warning))
         (if (not tex)
             (unless quiet (message "abella-tex: nothing to preview here."))
-          (abella-tex--show beg end tex))))))
+          (abella-tex--show
+           beg end
+           (if heading
+               (let ((split (abella-tex--split-macros tex)))
+                 (concat (car split) "\n\n\\begin{array}{l}\n"
+                         heading " \\\\\n" (cdr split) "\n\\end{array}"))
+             tex)))))))
 
 ;; ------------------------------------------------------------------
 ;; Parsing a full proof-state display in the output buffer
@@ -256,16 +336,26 @@ after \": \" -- else nil."
         (when (and (> (length name) 0) (string-match-p "\\`[A-Za-z0-9_']+\\'" name))
           (cons name (+ i 2)))))))
 
-(defun abella-tex--render-state-in-buffer (beg)
+(defun abella-tex--render-state-in-buffer (beg configs &optional heading)
   "In the current buffer -- assumed to be the *abella:...* output buffer,
 just filled with a full proof-state display by `abella--show-live-state'
 over [BEG, `point-max') (a sub-region at the tail of the buffer,
 following whatever persistent event log precedes it -- never the whole
 buffer, unlike the command-transcript case) -- render each hypothesis's
-formula and the goal as TeX in place, via `abella-tex--render-and-show'.
+formula and the goal as TeX in place, via `abella-tex--render-and-show',
+using CONFIGS (see `abella-tex--render-and-show'; the caller must
+resolve this from the Abella source buffer, not this output buffer).
 A no-op if [BEG, `point-max') doesn't actually hold a state (no \"====\"
 separator line is found -- e.g. \"(no proof state; at top level)\"), so
 this is always safe to call on whatever that region currently shows.
+
+HEADING, if non-nil (see `abella-tex--render-and-show'), is spliced in
+above the FIRST thing actually rendered -- the first hypothesis, or
+the goal if there are none -- so the currently open theorem's own
+\"Theorem NAME:\" shows above the live state too, not just once its
+proof closes and it becomes a persistent event (the caller must
+resolve this from `abella--pending-theorem' in the Abella source
+buffer, same reasoning as CONFIGS).
 
 A line-based re-implementation of abella-mcp's own
 bin/proof_state.ml parser (`hyp_name', `is_indented', `is_separator'),
@@ -310,10 +400,11 @@ overlays need real buffer positions to anchor to."
               (setq end (point)))
             (when (> end beg)
               (abella-tex--render-and-show
-               (buffer-substring-no-properties beg end) "term" beg end t))))
+               (buffer-substring-no-properties beg end) "term" configs beg end t heading)
+              (setq heading nil))))
         (when (> goal-end goal-beg)
           (abella-tex--render-and-show
-           (buffer-substring-no-properties goal-beg goal-end) "term" goal-beg goal-end t))))))
+           (buffer-substring-no-properties goal-beg goal-end) "term" configs goal-beg goal-end t heading))))))
 
 ;; ------------------------------------------------------------------
 ;; Rendering persistent session events in the output buffer
@@ -335,13 +426,172 @@ or malformed text Abella itself rejected) both need
 which every caller of this function goes through."
   (if (member kw '("Theorem" "Query")) "term" "commands"))
 
-(defun abella-tex--render-events-in-buffer (events)
+(defun abella-tex--split-macros (tex)
+  "TEX is a \\newcommand macros preamble, a blank line, then a body --
+the shape every non-nil `abella-tex--unwrap-display' TEX always has
+\(see `abella-tex--render''s own \"macros\" request\). Returns
+\(MACROS . BODY\), so a caller combining two separate renderings (a
+Define/CoDefine's own body plus its synthetic type-header rendering,
+in `abella-tex--render-event-and-show') can keep just one copy of
+MACROS -- both requests carry an identical copy, since it's derived
+from the same notation config either way -- instead of emitting the
+whole \\newcommand block twice into one image."
+  (let ((sep (string-match "\n\n" tex)))
+    (if sep (cons (substring tex 0 sep) (substring tex (match-end 0)))
+      (cons "" tex))))
+
+(defun abella-tex--splice-align-heading (body heading-row)
+  "BODY is a Define/CoDefine event's own rendered body (macros already
+split off via `abella-tex--split-macros') -- always a
+\\begin{align*}...\\end{align*} block, abella2tex's own fixed
+\"commands\"-mode output shape for these two commands (confirmed
+empirically, the same way `abella-tex--render''s own \\[ \\] handling
+is). Returns BODY with HEADING-ROW (a bare TeX math-mode fragment, no
+leading \"&\" or trailing \"\\\\\") spliced in as a new first row, so it
+renders above the clauses inside the very same align* block -- keeping
+everything as the one combined image `abella-tex--show' places over
+the event's whole span, so toggling rendering off still reverts
+instantly to the plain, untouched source text underneath.
+
+Falls back to wrapping HEADING-ROW and BODY together in their own
+array instead, if BODY doesn't actually start with \\begin{align*} --
+defensive only; shouldn't happen for a real Define/CoDefine."
+  (if (string-match "\\`\\\\begin{align\\*}\n" body)
+      (concat (substring body 0 (match-end 0))
+              "  &" heading-row " \\\\\n"
+              (substring body (match-end 0)))
+    (concat "\\begin{array}{l}\n" heading-row " \\\\\n" body "\n\\end{array}")))
+
+(defun abella-tex--header-to-type-command (name type)
+  "The bare \"Type NAME TYPE.\" command for one (NAME . TYPE) pair off a
+Define/CoDefine event's own `abella-define-decl-names-types' --
+Abella's own Type declaration syntax has NO colon (e.g. the source
+file's own \"Type lvl  tm -> ord -> prop.\"), so NAME and TYPE (already
+split apart by `abella-mcp--parse-define-decl', abella-mcp.el) are
+simply space-joined rather than needing any colon bookkeeping here."
+  (concat "Type " name " " type "."))
+
+(defun abella-tex--render-define-heading (decl keyword configs)
+  "The Define/CoDefine heading row TeX (a bare math-mode fragment, no
+macros preamble -- see `abella-tex--split-macros') for DECL (an
+`abella-define-decl', or nil) under KEYWORD (\"Define\" or
+\"CoDefine\"): \"\\text{Define }TYPE1, TYPE2, ...\\ \\text{by}\", each
+\(NAME . TYPE\) pair in DECL's own `names-types' rendered as real math
+via its own synthetic \"Type ... .\" command (see
+`abella-tex--header-to-type-command') fed through abella2tex's
+\"commands\" mode -- the very same renderer already used for real
+Kind/Type declarations, so it picks up CONFIGS/`notation.conf'
+identically -- and every pair's own rendering joined with \", \" (an
+ordinary single-name Define is just the one-pair case of this; a
+mutual Define, e.g. \"Define foo : ty1, bar : ty2 by ...\", renders
+all of them). nil if DECL is nil, has no pairs, or abella2tex rendered
+none of them -- silently, same as every other event rendering (see
+`abella-tex--render-events-in-buffer')."
+  (when decl
+    (let ((rendered
+           (delq nil
+                 (mapcar
+                  (lambda (name-type)
+                    (let ((result (abella-tex--render
+                                   (abella-tex--header-to-type-command (car name-type) (cdr name-type))
+                                   "commands" configs)))
+                      (unless (cdr result)
+                        (let ((unwrapped (abella-tex--unwrap-display (car result))))
+                          (when (car unwrapped) (cdr (abella-tex--split-macros (car unwrapped))))))))
+                  (abella-define-decl-names-types decl)))))
+      (when rendered
+        (concat "\\text{" keyword " }" (mapconcat #'identity rendered ", ") "\\ \\text{by}")))))
+
+(defun abella-tex--theorem-heading-row (decl keyword)
+  "The Theorem/Query heading row TeX (a bare math-mode fragment) for
+DECL (an `abella-theorem-decl', or nil) under KEYWORD (\"Theorem\" or
+\"Query\"): \"\\text{Theorem }\\text{NAME}\\text{:}\" if DECL has a
+name, else just \"\\text{KEYWORD:}\" (a Query, or a decl-less event,
+has none). No abella2tex call needed, unlike
+`abella-tex--render-define-heading' -- the name itself is shown as
+plain text, not math, so there's no notation to apply."
+  (let ((name (and decl (abella-theorem-decl-name decl))))
+    (if name (concat "\\text{" keyword " }\\text{" name "}\\text{:}")
+      (concat "\\text{" keyword ":}"))))
+
+(defun abella-tex--pending-theorem-heading ()
+  "The heading row TeX (see `abella-tex--theorem-heading-row') for
+`abella--pending-theorem' -- the Theorem/Split whose proof is
+currently open, if any -- or nil if there is none (at the top level,
+or between commands). Meant to be called in the Abella SOURCE buffer
+\(where `abella--pending-theorem' is the buffer-local one that
+matters\), same as `abella-tex--configs-arg', before switching into
+the output buffer to actually render the live state; see
+`abella-tex--render-state-in-buffer''s own HEADING parameter."
+  (when abella--pending-theorem
+    (abella-tex--theorem-heading-row
+     (abella-event-decl abella--pending-theorem)
+     (abella-event-kind abella--pending-theorem))))
+
+(defun abella-tex--render-event-and-show (ev configs beg end)
+  "Render one event EV -- see `abella-tex--render-events-in-buffer',
+which calls this once per event -- and show it over [BEG, END), same
+as `abella-tex--render-and-show' would for EV's own
+`abella-event-command'/mode, except a Define/CoDefine or Theorem/Query
+event also gets its own heading row spliced in above its body, both
+still as the ONE combined image `abella-tex--show' places over the
+event's whole span (so the underlying plain source text, heading
+included, is always what reappears the instant rendering is toggled
+off -- nothing here ever touches real buffer text, only overlay
+`display' properties, exactly like every other renderer in this file).
+Any tool error or empty rendering is skipped silently, same as
+`abella-tex--render-and-show' with QUIET -- the only mode events are
+ever rendered in (see `abella-tex--render-events-in-buffer').
+
+For a Theorem/Query event with a `decl', the BODY render itself uses
+`abella-theorem-decl-statement' instead of the raw `command' -- already
+exactly the header-stripped text `abella-tex--strip-header' would
+otherwise re-derive from `command', so this skips that redundant
+reparse; falls back to `command' unchanged if `decl' is ever nil."
+  (let* ((command (abella-event-command ev))
+         (kind (abella-event-kind ev))
+         (decl (abella-event-decl ev))
+         (mode (abella-tex--declaration-mode kind))
+         (source (if (and decl (member kind '("Theorem" "Query")))
+                     (abella-theorem-decl-statement decl)
+                   command))
+         (result (abella-tex--render source mode configs)))
+    (unless (cdr result)
+      (let ((tex (car (abella-tex--unwrap-display (car result)))))
+        (when tex
+          (let* ((split (abella-tex--split-macros tex))
+                 (macros (car split)) (body (cdr split))
+                 (combined
+                  (cond
+                   ((member kind '("Define" "CoDefine"))
+                    (let ((heading (abella-tex--render-define-heading decl kind configs)))
+                      (if heading (abella-tex--splice-align-heading body heading) body)))
+                   ((member kind '("Theorem" "Query"))
+                    (concat "\\begin{array}{l}\n"
+                            (abella-tex--theorem-heading-row decl kind) " \\\\\n"
+                            body "\n\\end{array}"))
+                   ((member kind '("Kind" "Type"))
+                    ;; Unlike Define/CoDefine, a Kind/Type declaration's
+                    ;; own BODY -- via abella2tex's "commands" mode -- is
+                    ;; already the complete bare rendering (e.g.
+                    ;; "\rel{lvl} : \rel{tm} \to \rel{ord} \to \rel{prop}"
+                    ;; for "Type lvl  tm -> ord -> prop."), with no
+                    ;; separate clause list below it the way a Define
+                    ;; has -- so the keyword is just prefixed directly,
+                    ;; no splicing/wrapping/second abella2tex call needed.
+                    (concat "\\text{" kind " }" body))
+                   (t body))))
+            (abella-tex--show beg end (concat macros "\n\n" combined))))))))
+
+(defun abella-tex--render-events-in-buffer (events configs)
   "In the current buffer -- assumed to be the *abella:...* output
 buffer, into which EVENTS (abella-mcp.el's `abella-event' structs, in
 order) were just appended by `abella--append-events' -- render each
 event's own `abella-event-command' (its clean source text, straight
 from the source buffer, not abella_mcp's comment-stripped echo) as TeX
-in place, via `abella-tex--render-and-show', over just its own
+in place, via `abella-tex--render-event-and-show' (using CONFIGS --
+see `abella-tex--render-and-show'; the caller must resolve this from
+the Abella source buffer, not this output buffer), over just its own
 \"> \" + `abella-event-raw' span: from its own
 `abella-event-output-marker' to exactly `abella-event-raw's own
 length past it -- NOT all the way to the next event (or `point-max'),
@@ -358,15 +608,13 @@ still replaces the display of its *whole* raw span, tactics and all
 anyway), just not the separator/warnings after it; the underlying text
 is untouched regardless, so it's still there, unrendered, the moment
 this preview is toggled off. A failed event's own command is rendered
-the same uniform way -- `abella-tex--render-and-show' already degrades
-quietly (no image) if abella2tex can't make sense of it, exactly like
-any other non-renderable declaration."
+the same uniform way -- `abella-tex--render-event-and-show' already
+degrades quietly (no image) if abella2tex can't make sense of it,
+exactly like any other non-renderable declaration."
   (dolist (ev events)
     (let* ((beg (marker-position (abella-event-output-marker ev)))
            (end (+ beg 2 (length (abella-event-raw ev))))) ; "> " + raw
-      (abella-tex--render-and-show
-       (abella-event-command ev) (abella-tex--declaration-mode (abella-event-kind ev))
-       beg end t))))
+      (abella-tex--render-event-and-show ev configs beg end))))
 
 ;; ------------------------------------------------------------------
 ;; Toggle command
@@ -392,9 +640,16 @@ this Abella source buffer, exactly like the advice this replaces (see
   (ignore text)
   (when (and abella-tex--render-output-p
              abella--live-state-marker (marker-buffer abella--live-state-marker))
-    (let ((marker abella--live-state-marker))
+    ;; Resolved here, in the SOURCE buffer -- see
+    ;; `abella-tex--render-and-show''s note on CONFIGS -- before
+    ;; `with-current-buffer' switches into the output buffer below,
+    ;; where `abella-tex--configs-arg' couldn't find `notation.conf',
+    ;; and `abella--pending-theorem' would be this OTHER buffer's own
+    ;; (nil) binding, not the source buffer's.
+    (let ((marker abella--live-state-marker) (configs (abella-tex--configs-arg))
+          (heading (abella-tex--pending-theorem-heading)))
       (with-current-buffer (marker-buffer marker)
-        (abella-tex--render-state-in-buffer (marker-position marker))))))
+        (abella-tex--render-state-in-buffer (marker-position marker) configs heading)))))
 
 (advice-add 'abella--show-live-state :after #'abella-tex--after-show-live-state)
 
@@ -408,8 +663,12 @@ to this Abella source buffer (`abella--append-events's own
 the time `:after' advice runs), so `abella-tex--render-output-p' is
 read from the right place without needing to pass it explicitly."
   (when (and abella-tex--render-output-p new-events)
-    (with-current-buffer (abella-output-buffer-name)
-      (abella-tex--render-events-in-buffer new-events))))
+    ;; Resolved here, in the SOURCE buffer -- see
+    ;; `abella-tex--render-and-show''s note on CONFIGS -- before
+    ;; `with-current-buffer' switches into the output buffer below.
+    (let ((configs (abella-tex--configs-arg)))
+      (with-current-buffer (abella-output-buffer-name)
+        (abella-tex--render-events-in-buffer new-events configs)))))
 
 (advice-add 'abella--append-events :after #'abella-tex--after-append-events)
 
@@ -421,7 +680,7 @@ reverted by a later `abella-tex-toggle-preview' call the way the
 persistent state rendering is, since the output buffer's content is
 already routinely replaced by ordinary Abella activity."
   (let* ((source (buffer-substring-no-properties beg end))
-         (result (abella-tex--render source "term")))
+         (result (abella-tex--render source "term" (abella-tex--configs-arg))))
     (with-current-buffer (get-buffer-create (abella-output-buffer-name))
       (unless (derived-mode-p 'abella-output-mode) (abella-output-mode))
       (let ((inhibit-read-only t))
@@ -457,20 +716,32 @@ underneath was never touched, so it reappears immediately."
       (abella-tex--preview-region-in-output (region-beginning) (region-end))
     (setq abella-tex--render-output-p (not abella-tex--render-output-p))
     (if abella-tex--render-output-p
-        (progn
+        ;; Resolved once here, in the SOURCE buffer -- see
+        ;; `abella-tex--render-and-show''s note on CONFIGS -- before
+        ;; either `with-current-buffer' below switches into the output
+        ;; buffer.
+        (let ((configs (abella-tex--configs-arg)))
           ;; Render whatever the output buffer already shows, the same
           ;; way `abella-tex--after-show-live-state'/
           ;; `abella-tex--after-append-events' render it going forward:
           ;; the live-state region, if a proof is currently open --
           (when (and abella--live-state-marker (marker-buffer abella--live-state-marker))
-            (let ((marker abella--live-state-marker))
+            (let ((marker abella--live-state-marker)
+                  (heading (abella-tex--pending-theorem-heading)))
               (with-current-buffer (marker-buffer marker)
-                (abella-tex--render-state-in-buffer (marker-position marker)))))
+                (abella-tex--render-state-in-buffer (marker-position marker) configs heading))))
           ;; -- and every already-finalized event, oldest first (matching
           ;; buffer/display order; `abella-events' itself is newest first).
-          (when abella-events
-            (with-current-buffer (abella-output-buffer-name)
-              (abella-tex--render-events-in-buffer (reverse abella-events))))
+          ;; `events' is resolved HERE, still in the source buffer, not
+          ;; as part of the `with-current-buffer' call below -- Elisp
+          ;; evaluates a `with-current-buffer' body's forms (including
+          ;; their own argument subexpressions) only after the buffer
+          ;; switch, so `(reverse abella-events)' inlined into that call
+          ;; would read the OUTPUT buffer's own (nil) binding instead.
+          (let ((events (reverse abella-events)))
+            (when events
+              (with-current-buffer (abella-output-buffer-name)
+                (abella-tex--render-events-in-buffer events configs))))
           (message "abella-tex: output rendering on"))
       (when (get-buffer (abella-output-buffer-name))
         (with-current-buffer (abella-output-buffer-name)

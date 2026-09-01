@@ -166,11 +166,48 @@ succeeded, at the buffer position right after it.")
 ;; lockstep with `abella-checkpoints' (advanced/retracted together, in
 ;; the same functions) so the two never drift apart.
 
+;; Structured per-kind declaration info, parsed once at event-creation
+;; time (`abella-mcp--parse-decl' and its per-kind helpers, below)
+;; straight off the SOURCE buffer's own real positions -- never
+;; re-derived later from a detached `abella-event-command' string, the
+;; way abella-tex.el used to (regexes anchored at a string's start,
+;; silently defeated by a doc comment sitting directly above a
+;; command: interpretation.thm's `setp'/`elp'/`elp*' Defines each have
+;; one, `step' doesn't, which is why only `step' ever got a heading).
+;; Each struct carries exactly the fields its own kind needs for
+;; rendering; an event whose kind has no structured shape (Import,
+;; Specification, Set, Close, Split -- see `abella-mcp--parse-decl')
+;; simply has `abella-event-decl' nil.
+(cl-defstruct (abella-kind-decl (:constructor abella-kind-decl-create))
+  names      ; list of declared names, e.g. ("k" "tm") for "Kind k, tm  type."
+  kind-expr) ; the trailing kind-expression source text, e.g. "type"
+
+(cl-defstruct (abella-type-decl (:constructor abella-type-decl-create))
+  names  ; list of declared names sharing TYPE, e.g. ("or" "imp" "and")
+  type)  ; the shared type-expression source text
+
+(cl-defstruct (abella-define-decl (:constructor abella-define-decl-create))
+  names-types  ; list of (NAME . TYPE) conses -- more than one only for
+               ;   a mutual Define, e.g. "Define foo : ty1, bar : ty2 by ..."
+  clauses)     ; list of clause source-text strings (split on top-level
+               ;   ";", comments intact, each trimmed)
+
+(cl-defstruct (abella-theorem-decl (:constructor abella-theorem-decl-create))
+  name       ; the theorem's own name, or nil for a Query (which has none)
+  statement  ; the formula source text after the name/colon
+  proof)     ; the tactic-script source text, filled in via `setf' only
+             ;   once the proof actually closes (nil until then, and
+             ;   always nil for a Query, which has no proof)
+
 (cl-defstruct (abella-event (:constructor abella-event-create))
   kind       ; the top-level keyword string, e.g. "Theorem", "Define", ...
   command    ; this event's own source text: a theorem's *statement*
              ;   only (not its proof script) for a Theorem/Split event,
              ;   the whole command otherwise
+  decl       ; this event's own structured declaration info -- an
+             ;   `abella-kind-decl'/`abella-type-decl'/`abella-define-decl'/
+             ;   `abella-theorem-decl' depending on `kind', or nil (see
+             ;   `abella-mcp--parse-decl')
   status     ; 'ok or 'error
   raw        ; abella_mcp's own transcript chunk(s) for this event, its
              ;   command echo(es) and reply concatenated verbatim, in
@@ -252,15 +289,133 @@ patterns and push any found onto EVENT's `abella-event-warnings'."
   (when (string-match-p (regexp-quote abella-mcp--skip-marker) raw)
     (push "Proof completed via skip" (abella-event-warnings event))))
 
-(defun abella-mcp--events-from-batch (from positions raw-chunks &optional failed-cmd failed-chunk)
+(defun abella-mcp--parse-kind-decl (start end)
+  "`abella-kind-decl' for a \"Kind ... .\" command spanning [START, END)
+\(its own leading keyword through its trailing period\) in the current
+buffer."
+  (save-excursion
+    (goto-char start)
+    (abella-skip-whitespace-and-comments)
+    (skip-chars-forward "A-Za-z")
+    (abella-skip-whitespace-and-comments)
+    (let ((names (abella-parse-identifier-list)))
+      (abella-skip-whitespace-and-comments)
+      (abella-kind-decl-create
+       :names names
+       :kind-expr (string-trim (buffer-substring-no-properties (point) (1- end)))))))
+
+(defun abella-mcp--parse-type-decl (start end)
+  "`abella-type-decl' for a \"Type ... .\" command spanning [START, END),
+same shape as `abella-mcp--parse-kind-decl'."
+  (save-excursion
+    (goto-char start)
+    (abella-skip-whitespace-and-comments)
+    (skip-chars-forward "A-Za-z")
+    (abella-skip-whitespace-and-comments)
+    (let ((names (abella-parse-identifier-list)))
+      (abella-skip-whitespace-and-comments)
+      (abella-type-decl-create
+       :names names
+       :type (string-trim (buffer-substring-no-properties (point) (1- end)))))))
+
+(defun abella-mcp--parse-define-decl (start end)
+  "`abella-define-decl' for a \"Define/CoDefine ... by ... .\" command
+spanning [START, END): NAMES-TYPES from the comma-separated
+\"name : type\" pairs before \"by\" (`abella-top-level-segments' on
+\",\"), CLAUSES from the \";\"-separated clause list after it. Falls
+back to an all-nil decl if no top-level \"by\" is found (malformed
+input -- e.g. a command Abella itself rejected)."
+  (save-excursion
+    (goto-char start)
+    (abella-skip-whitespace-and-comments)
+    (skip-chars-forward "A-Za-z")
+    (let ((names-start (point))
+          (by-start (abella-find-first-top-level "\\<by\\>" (point) end)))
+      (if (not by-start)
+          (abella-define-decl-create :names-types nil :clauses nil)
+        (let* ((header-end (save-excursion (goto-char by-start) (skip-chars-backward " \t\n") (point)))
+               (by-end (save-excursion (goto-char by-start) (skip-chars-forward "A-Za-z") (point)))
+               (names-types
+                (mapcar
+                 (lambda (seg)
+                   (goto-char (car seg))
+                   (abella-skip-whitespace-and-comments)
+                   (if (looking-at (concat "\\(" abella-identifier-regexp "\\)[ \t\n]*:"))
+                       (cons (match-string-no-properties 1)
+                             (string-trim (buffer-substring-no-properties (match-end 0) (cdr seg))))
+                     (cons (string-trim (buffer-substring-no-properties (car seg) (cdr seg))) "")))
+                 (abella-top-level-segments "," names-start header-end)))
+               (clauses
+                (mapcar
+                 (lambda (seg) (string-trim (buffer-substring-no-properties (car seg) (cdr seg))))
+                 (abella-top-level-segments ";" by-end (1- end)))))
+          (abella-define-decl-create :names-types names-types :clauses clauses))))))
+
+(defun abella-mcp--parse-theorem-decl (start end)
+  "`abella-theorem-decl' for a \"Theorem NAME : STATEMENT.\" command
+spanning [START, END) -- its statement only, per `abella-event-command's
+own contract for a Theorem/Split event: END is the position right
+after the statement's own trailing period, never the proof's tactics."
+  (save-excursion
+    (goto-char start)
+    (abella-skip-whitespace-and-comments)
+    (skip-chars-forward "A-Za-z")
+    (abella-skip-whitespace-and-comments)
+    (let* ((name (when (looking-at abella-identifier-regexp)
+                   (prog1 (match-string-no-properties 0) (goto-char (match-end 0)))))
+           (colon (abella-find-first-top-level ":" (point) end)))
+      (abella-theorem-decl-create
+       :name name
+       :statement (string-trim
+                   (buffer-substring-no-properties (if colon (1+ colon) (point)) (1- end)))
+       :proof nil))))
+
+(defun abella-mcp--parse-query-decl (start end)
+  "`abella-theorem-decl' for a \"Query GOAL.\" command spanning
+[START, END) -- NAME and PROOF nil (a Query has neither)."
+  (save-excursion
+    (goto-char start)
+    (abella-skip-whitespace-and-comments)
+    (skip-chars-forward "A-Za-z")
+    (abella-theorem-decl-create
+     :name nil
+     :statement (string-trim (buffer-substring-no-properties (point) (1- end)))
+     :proof nil)))
+
+(defun abella-mcp--parse-decl (kind start end)
+  "Structured declaration info for a command of KIND spanning
+[START, END) in the current buffer, or nil if KIND has no structured
+shape (Import, Specification, Set, Close, Split -- Split's own
+grammar, \"Split THEOREM as name1, name2, ....\", doesn't fit
+`abella-theorem-decl', and no renderer needs it yet; an unrecognized
+keyword, e.g. a tactic name when START/END actually span a failed
+command mid-proof, also falls through to nil). Never signals -- a
+malformed/partial command (Abella itself rejected it, or KIND's own
+parser hit something it didn't expect) degrades to nil rather than
+erroring event construction."
+  (condition-case nil
+      (pcase kind
+        ("Kind" (abella-mcp--parse-kind-decl start end))
+        ("Type" (abella-mcp--parse-type-decl start end))
+        ((or "Define" "CoDefine") (abella-mcp--parse-define-decl start end))
+        ("Theorem" (abella-mcp--parse-theorem-decl start end))
+        ("Query" (abella-mcp--parse-query-decl start end))
+        (_ nil))
+    (error nil)))
+
+(defun abella-mcp--events-from-batch (from positions raw-chunks &optional failed-cmd failed-chunk failed-end)
   "Build/update this buffer's session events for one batch.
 
 POSITIONS are the end positions of the commands that succeeded,
 starting at FROM (a slice of what `abella-split-commands' returned);
 RAW-CHUNKS is the parallel list of their raw transcript chunks (a
 slice of what `abella-mcp--split-transcript' returns). If the batch stopped
-on an error, FAILED-CMD is that command's own source text and
-FAILED-CHUNK its raw chunk.
+on an error, FAILED-CMD is that command's own source text, FAILED-CHUNK
+its raw chunk, and FAILED-END the buffer position right after it (used
+only to parse a `decl' for it, via `abella-mcp--parse-decl' -- FROM,
+still in scope as the loop's own `start' by the time the failed branch
+runs, and FAILED-END together give the failed command's own [START,
+END) span).
 
 Updates `abella--pending-theorem' and pushes onto `abella-events' via
 the state machine: outside a pending theorem, a Theorem/Split command
@@ -295,32 +450,52 @@ to the return value until some later call finalizes it."
                           (concat (abella-event-raw abella--pending-theorem) "> " raw))
                     (abella-mcp--scan-warnings abella--pending-theorem raw)
                     (when (abella-mcp--closes-proof-p raw)
+                      ;; Fill in the proof now that its extent is finally
+                      ;; known -- from right after the statement's own
+                      ;; header (where `start-marker' was set when this
+                      ;; event was first created, below) through END, the
+                      ;; position right after the closing tactic's own
+                      ;; period. A decl-less event (Split, or a Theorem
+                      ;; whose own parse failed) has nothing to fill.
+                      (when (abella-event-decl abella--pending-theorem)
+                        (setf (abella-theorem-decl-proof (abella-event-decl abella--pending-theorem))
+                              (buffer-substring-no-properties
+                               (marker-position (abella-event-start-marker abella--pending-theorem)) end)))
                       (setf (abella-event-source-marker abella--pending-theorem)
                             (copy-marker end))
                       (push abella--pending-theorem abella-events)
                       (push abella--pending-theorem new-events)
                       (setq abella--pending-theorem nil)))
                    ((member (abella-command-keyword start) '("Theorem" "Split"))
-                    (setq abella--pending-theorem
-                          (abella-event-create :kind (abella-command-keyword start)
-                                                :command cmd :status 'ok :raw raw
-                                                :start-marker (copy-marker end)))
+                    (let ((kind (abella-command-keyword start)))
+                      (setq abella--pending-theorem
+                            (abella-event-create :kind kind
+                                                  :command cmd :decl (abella-mcp--parse-decl kind start end)
+                                                  :status 'ok :raw raw
+                                                  :start-marker (copy-marker end))))
                     (abella-mcp--scan-warnings abella--pending-theorem raw))
                    (t
-                    (let ((ev (abella-event-create :kind (abella-command-keyword start)
-                                                    :command cmd :status 'ok :raw raw
-                                                    :source-marker (copy-marker end))))
+                    (let* ((kind (abella-command-keyword start))
+                           (ev (abella-event-create :kind kind
+                                                     :command cmd :decl (abella-mcp--parse-decl kind start end)
+                                                     :status 'ok :raw raw
+                                                     :source-marker (copy-marker end))))
                       (abella-mcp--scan-warnings ev raw)
                       (push ev abella-events)
                       (push ev new-events))))
                   (setq start end)))
     (when failed-cmd
-      (let ((ev (abella-event-create :kind (abella-command-keyword start)
-                                      :command failed-cmd :status 'error :raw failed-chunk
-                                      :source-marker (copy-marker (abella-locked-position)))))
+      (let* ((kind (abella-command-keyword start))
+             (ev (abella-event-create
+                  :kind kind
+                  :command failed-cmd
+                  :decl (and failed-end (abella-mcp--parse-decl kind start failed-end))
+                  :status 'error :raw failed-chunk
+                  :source-marker (copy-marker (abella-locked-position)))))
         (when abella--pending-theorem
           (setf (abella-event-command ev) (abella-event-command abella--pending-theorem))
           (setf (abella-event-kind ev) (abella-event-kind abella--pending-theorem))
+          (setf (abella-event-decl ev) (abella-event-decl abella--pending-theorem))
           (setf (abella-event-raw ev)
                 (concat (abella-event-raw abella--pending-theorem) "> " failed-chunk))
           (setq abella--pending-theorem nil))
@@ -845,16 +1020,17 @@ starting a session keeps failing."
             ;; never reached Abella at all -- nothing command-level
             ;; happened there to log.
             (when (or (> succeeded 0) (and is-error (> shown 0)))
-              (let* ((failed-cmd
-                      (and is-error (> shown 0) (< succeeded n)
+              (let* ((failed-end (and is-error (> shown 0) (< succeeded n) (nth succeeded positions)))
+                     (failed-cmd
+                      (and failed-end
                            (buffer-substring-no-properties
                             (if (> succeeded 0) (nth (1- succeeded) positions) from)
-                            (nth succeeded positions))))
+                            failed-end)))
                      (failed-chunk (and is-error (> shown 0) (nth succeeded chunks))))
                 (abella--append-events
                  (abella-mcp--events-from-batch
                   from (seq-take positions succeeded) (seq-take chunks succeeded)
-                  failed-cmd failed-chunk))))
+                  failed-cmd failed-chunk failed-end))))
             ;; On error, the transcript is what shows which command
             ;; failed and why; on success, `abella--report' decides
             ;; between the transcript and the full state.

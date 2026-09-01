@@ -150,12 +150,22 @@ REGEXP in [FROM, TO), or nil if there is none."
           (setq start (point))))
       start)))
 
+(defun abella-skip-whitespace-and-comments ()
+  "Skip forward, at point in the current buffer, over any run of
+whitespace and Abella `%...' comments. The one primitive every
+buffer-position-based command/header scanner in this file (and, via
+`abella-mcp--parse-decl' and friends, abella-mcp.el's structured
+per-event declaration parsing) builds on, so a doc comment sitting
+directly above a command is always skipped exactly the same way,
+rather than each caller re-approximating it."
+  (while (or (> (skip-chars-forward " \t\n") 0)
+             (forward-comment 1))))
+
 (defun abella-command-keyword (cmd-start)
   "Return the leading keyword of the command starting at CMD-START."
   (save-excursion
     (goto-char cmd-start)
-    (while (or (> (skip-chars-forward " \t\n") 0)
-               (forward-comment 1)))
+    (abella-skip-whitespace-and-comments)
     (when (looking-at "[A-Za-z]+")
       (match-string-no-properties 0))))
 
@@ -165,8 +175,7 @@ REGEXP in [FROM, TO), or nil if there is none."
     (save-restriction
       (narrow-to-region from to)
       (goto-char from)
-      (while (or (> (skip-chars-forward " \t\n") 0)
-                 (forward-comment 1)))
+      (abella-skip-whitespace-and-comments)
       (eobp))))
 
 (defun abella-header-indent-column (cmd-start)
@@ -175,11 +184,66 @@ header should align: the column of the first predicate name, if it
 appears on the same line as the keyword; otherwise a flat 2-space indent."
   (save-excursion
     (goto-char cmd-start)
-    (while (or (> (skip-chars-forward " \t\n") 0)
-               (forward-comment 1)))
+    (abella-skip-whitespace-and-comments)
     (skip-chars-forward "A-Za-z")
     (skip-chars-forward " \t")
     (if (eolp) 2 (current-column))))
+
+(defconst abella-identifier-regexp
+  "[A-Za-z=`'?$-][A-Za-z=`'?$0-9_/*@+#!~-]*"
+  "Regexp matching one Abella identifier -- mirrors the real lexer's own
+`ichar (ichar|bchar)*' rule (src/lexer.mll in the Abella distribution
+itself): an initial ICHAR (a letter, `-', `=', a backquote, apostrophe,
+`?', or `$'), followed by any run of ICHAR or BCHAR (also digits, `_',
+`/', `*', `@', `+', `#', `!', `~'). Deliberately NOT the more obvious
+`[A-Za-z][A-Za-z0-9_']*' -- that misses real identifiers this project's
+own example files use, e.g. `elp*' and `elp-subst' (interpretation.thm).
+Anchoring/word-boundary callers should still wrap this in \\< \\>
+themselves where that matters; this constant is the bare character
+class only.")
+
+(defun abella-parse-identifier-list ()
+  "At point in the current buffer, consume a comma-separated run of
+bare Abella identifiers (`abella-identifier-regexp'), skipping
+whitespace and comments (`abella-skip-whitespace-and-comments')
+between tokens, stopping as soon as an identifier is not followed by a
+top-level comma -- i.e. right after the LAST name of a
+`Kind NAME1, NAME2  ...'/`Type NAME1, NAME2  ...' style list, leaving
+whatever follows (a kind or type expression) untouched. Returns the
+list of identifier strings, in order; point is left right after the
+last one consumed (or unmoved, for an empty list)."
+  (let (names)
+    (abella-skip-whitespace-and-comments)
+    (while (looking-at (concat "\\(" abella-identifier-regexp "\\)[ \t\n]*,"))
+      (push (match-string-no-properties 1) names)
+      (goto-char (match-end 0))
+      (abella-skip-whitespace-and-comments))
+    (when (looking-at abella-identifier-regexp)
+      (push (match-string-no-properties 0) names)
+      (goto-char (match-end 0)))
+    (nreverse names)))
+
+(defun abella-top-level-segments (regexp from to)
+  "Split [FROM, TO) into a list of (START . END) conses, one per
+top-level segment as delimited by top-level matches of REGEXP -- the
+matched delimiter text itself excluded from both neighboring segments,
+e.g. splitting `a : ty1, b : ty2' on \",\" gives the two segments
+\"a : ty1\" and \" b : ty2\" (still needing their own trim). [FROM, TO)
+with no top-level match of REGEXP at all returns the single segment
+\(FROM . TO). Distinct from `abella-split-commands' (which returns
+positions *after* each top-level `.', keeping the terminator as part
+of its own command) -- REGEXP's match here is a pure separator, kept
+in neither neighbor, which is the right contract for a comma- or
+semicolon-separated list rather than a command sequence."
+  (save-excursion
+    (goto-char from)
+    (let (segments (seg-start from))
+      (while (re-search-forward regexp to t)
+        (when (abella-top-level-p (match-beginning 0))
+          (push (cons seg-start (match-beginning 0)) segments)
+          (setq seg-start (match-end 0))))
+      (push (cons seg-start to) segments)
+      (nreverse segments))))
 
 (defun abella-quantifier-depth (from to)
   "Count lines in [FROM, TO) that begin with a quantifier (forall/exists/
